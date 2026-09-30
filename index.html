@@ -170,6 +170,18 @@
     to { transform: translate(var(--dx), -220px) scale(1.3); opacity: 0; }
   }
 
+  /* Botão da música */
+  .som {
+    position: fixed; top: 14px; left: 14px; z-index: 6;
+    width: 46px; height: 46px; border-radius: 50%; border: 0; cursor: pointer;
+    font-size: 21px; line-height: 46px; text-align: center;
+    background: rgba(255, 255, 255, .85); box-shadow: 0 6px 16px rgba(120, 60, 110, .18);
+    animation: surgir .5s ease;
+  }
+  .som:active { transform: scale(.92); }
+  .som:focus-visible { outline: 3px solid var(--rosa); outline-offset: 2px; }
+  .som.desligada { opacity: .7; }
+
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation: none !important; transition: none !important; }
   }
@@ -182,6 +194,8 @@
   <div class="nuvem n2"></div>
   <div class="nuvem n3"></div>
 </div>
+
+<button class="som" id="som" hidden aria-label="Desligar música">🎵</button>
 
 <main>
   <!-- Tela 1 -->
@@ -238,6 +252,145 @@
   </section>
 </main>
 
+<script>
+/* Caixinha de música: melodia original gerada pelo navegador (Web Audio).
+   Começa quando ela toca em "Abrir" — celulares não deixam tocar antes disso. */
+var musica = (function () {
+  var ctx = null, mestre = null, tocando = false, ligada = true, proximo = 0, passo = 0, timer = null;
+  var BPM = 96, BATIDA = 60 / BPM;
+
+  // Frequência a partir do nome da nota (ex.: 'E5').
+  var SEMI = { C: -9, D: -7, E: -5, F: -4, G: -2, A: 0, B: 2 };
+  function freq(n) {
+    var oitava = parseInt(n.slice(-1), 10);
+    return 440 * Math.pow(2, (SEMI[n[0]] + (oitava - 4) * 12) / 12);
+  }
+
+  // Valsa em 3/4: [nota, tempos]. Acorde de cada compasso logo abaixo.
+  var MELODIA = [
+    [['E5',2],['G5',1]], [['C6',2],['B5',1]], [['A5',1],['G5',1],['E5',1]], [['G5',3]],
+    [['F5',2],['A5',1]], [['D6',2],['C6',1]], [['B5',1],['A5',1],['G5',1]], [['G5',3]],
+    [['E5',2],['G5',1]], [['C6',2],['E6',1]], [['D6',1],['C6',1],['A5',1]], [['G5',3]],
+    [['F5',1],['E5',1],['D5',1]], [['G5',2],['B5',1]], [['D6',1],['B5',1],['G5',1]], [['C6',3]]
+  ];
+  var ACORDES = [
+    ['C3','G3','E4'], ['C3','G3','E4'], ['A2','E3','C4'], ['G2','D3','B3'],
+    ['F2','C3','A3'], ['D3','A3','F4'], ['G2','D3','B3'], ['C3','G3','E4'],
+    ['C3','G3','E4'], ['A2','E3','C4'], ['F2','C3','A3'], ['C3','G3','E4'],
+    ['D3','A3','F4'], ['G2','D3','B3'], ['G2','D3','F4'], ['C3','G3','E4']
+  ];
+
+  // Um "plim" de caixinha de música: ataque rápido e som que vai sumindo.
+  function plim(f, quando, volume, duracao) {
+    var o1 = ctx.createOscillator(), o2 = ctx.createOscillator(), g = ctx.createGain();
+    o1.type = 'sine';     o1.frequency.value = f;
+    o2.type = 'triangle'; o2.frequency.value = f * 2;
+    var g2 = ctx.createGain(); g2.gain.value = 0.18;
+    o1.connect(g); o2.connect(g2); g2.connect(g); g.connect(mestre);
+    g.gain.setValueAtTime(0.0001, quando);
+    g.gain.exponentialRampToValueAtTime(volume, quando + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, quando + duracao);
+    o1.start(quando); o2.start(quando);
+    o1.stop(quando + duracao + 0.05); o2.stop(quando + duracao + 0.05);
+  }
+
+  function agendarCompasso(i, inicio) {
+    var t = inicio;
+    MELODIA[i].forEach(function (n) {
+      plim(freq(n[0]), t, 0.22, Math.max(1.2, n[1] * BATIDA * 1.6));
+      t += n[1] * BATIDA;
+    });
+    var a = ACORDES[i];
+    plim(freq(a[0]), inicio, 0.10, 2.2);
+    plim(freq(a[1]), inicio + BATIDA, 0.05, 1.2);
+    plim(freq(a[2]), inicio + BATIDA * 2, 0.05, 1.2);
+  }
+
+  function agendador() {
+    while (proximo < ctx.currentTime + 0.6) {
+      agendarCompasso(passo % MELODIA.length, proximo);
+      proximo += 3 * BATIDA;
+      passo++;
+      // Respiro de um compasso a cada volta da melodia.
+      if (passo % MELODIA.length === 0) proximo += 3 * BATIDA;
+    }
+  }
+
+  // No iPhone, o botão de silencioso cala o Web Audio; um áudio mudo em loop
+  // tocado no mesmo toque coloca a página no modo "reprodução".
+  function destravarIOS() {
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+    try {
+      var n = 4410, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+      function s(o, t) { for (var k = 0; k < t.length; k++) v.setUint8(o + k, t.charCodeAt(k)); }
+      s(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); s(8, 'WAVE'); s(12, 'fmt ');
+      v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+      v.setUint32(24, 44100, true); v.setUint32(28, 88200, true); v.setUint16(32, 2, true);
+      v.setUint16(34, 16, true); s(36, 'data'); v.setUint32(40, n * 2, true);
+      var mudo = new Audio(URL.createObjectURL(new Blob([buf], { type: 'audio/wav' })));
+      mudo.loop = true; mudo.volume = 0.01;
+      var p = mudo.play(); if (p && p.catch) p.catch(function () {});
+    } catch (e) {}
+  }
+
+  var botao = null;
+  function atualizarBotao() {
+    if (!botao) return;
+    botao.textContent = ligada ? '🎵' : '🔇';
+    botao.setAttribute('aria-label', ligada ? 'Desligar música' : 'Ligar música');
+    botao.classList.toggle('desligada', !ligada);
+  }
+
+  function iniciar() {
+    if (tocando) return;
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    destravarIOS();
+    ctx = new AC();
+    mestre = ctx.createGain();
+    mestre.gain.value = 0;
+    // Eco curtinho, para soar como caixinha dentro de um quarto.
+    var eco = ctx.createDelay(); eco.delayTime.value = 0.27;
+    var retorno = ctx.createGain(); retorno.gain.value = 0.28;
+    var molhado = ctx.createGain(); molhado.gain.value = 0.35;
+    mestre.connect(ctx.destination);
+    mestre.connect(eco); eco.connect(retorno); retorno.connect(eco);
+    eco.connect(molhado); molhado.connect(ctx.destination);
+    if (ctx.state === 'suspended') ctx.resume();
+    mestre.gain.setValueAtTime(0.0001, ctx.currentTime);
+    mestre.gain.exponentialRampToValueAtTime(0.9, ctx.currentTime + 2.5);
+    proximo = ctx.currentTime + 0.15;
+    tocando = true;
+    timer = setInterval(agendador, 120);
+    agendador();
+    botao = document.getElementById('som');
+    botao.hidden = false;
+    atualizarBotao();
+  }
+
+  function alternar() {
+    if (!ctx) return;
+    ligada = !ligada;
+    var agora = ctx.currentTime;
+    mestre.gain.cancelScheduledValues(agora);
+    mestre.gain.setValueAtTime(Math.max(mestre.gain.value, 0.0001), agora);
+    mestre.gain.exponentialRampToValueAtTime(ligada ? 0.9 : 0.0001, agora + 0.4);
+    atualizarBotao();
+  }
+
+  // Pausa quando ela sai da aba e volta quando ela retorna.
+  document.addEventListener('visibilitychange', function () {
+    if (!ctx) return;
+    if (document.hidden) ctx.suspend(); else ctx.resume();
+  });
+
+  document.addEventListener('DOMContentLoaded', function () {
+    document.getElementById('som').addEventListener('click', alternar);
+  });
+
+  return { iniciar: iniciar };
+})();
+</script>
 <script>
 (function () {
   var NOTICIAS = [
@@ -325,6 +478,7 @@
   function abrirPresente() {
     var p = centro(document.getElementById('caixa'));
     coracoes(p.x, p.y, 14);
+    musica.iniciar();
     setTimeout(function () {
       mostrar(t1, t2);
       adicionarNoticia();
